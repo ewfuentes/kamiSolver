@@ -6,6 +6,9 @@ from scipy import ndimage, signal
 import ipdb
 import Queue
 import graphviz
+import json
+import glob
+import itertools
 
 def getColorSelectionSection(img):
     return img[1260:, 300:]
@@ -255,8 +258,9 @@ def createBoardGraph(segs):
 
     return nodeDict
 
-def simplifyNodeDict(g, debug=False):
+def simplifyNodeDict(g, debug=False, returnOldToNew=False):
     step = 0
+    oldToNew = {}
     for key in list(g.keys()):
         currNode = g.get(key, None)
         if currNode is None:
@@ -273,21 +277,24 @@ def simplifyNodeDict(g, debug=False):
             for other in sameVals:
                 # These are the nodes that have the same values
                 # Copy over all connections
+                oldToNew[other.position] = currNode.position
                 for otherConn in other.connections:
                     other.removeConnection(otherConn)
                     currNode.addConnection(otherConn)
                     if debug:
                         print 'Step {}'.format(step),
-                        print 'Removing {} from {} and adding to {}'.format(otherConn.position, 
-                                                                        other.position,
-                                                                        currNode.position)
+                        print 'Removing {} from {} and adding to {}'.format(
+                                otherConn.position, other.position,
+                                currNode.position)
                 del g[other.position]
         if debug:
             drawNodeDict(g, 'step{0:03}'.format(step))
             step += 1
         
-
-    return g
+    if returnOldToNew:
+        return g, oldToNew
+    else:
+        return g
 
 def drawNodeDict(nd, fname):
     dot = graphviz.Graph(engine='neato')
@@ -350,7 +357,7 @@ def checkIfSolved(nd):
         return False
     return True
 
-def solvePuzzle(nd, movesRemaining, moveList):
+def solvePuzzleBruteForce(nd, movesRemaining, moveList):
     if movesRemaining == 0 and checkIfSolved(nd):
         return moveList
     elif movesRemaining == 0:
@@ -370,9 +377,19 @@ def solvePuzzle(nd, movesRemaining, moveList):
         return None
 
     for n in nodeList:
-        options = set()
+        options = []
+        if len(n.connections) == 0:
+            continue
+            
         for conn in n.connections:
-            options = options | {conn.value}
+            options.append(conn.value)
+
+        vals, counts = np.unique(options, return_counts=True)
+        countedOptions = zip(list(vals), list(counts))
+    
+        options = sorted(countedOptions, key=lambda x: x[1])[::-1]
+
+        options, _ = zip(*countedOptions)
 
         if len(options) == 0:
             for o in nodeList:
@@ -385,20 +402,200 @@ def solvePuzzle(nd, movesRemaining, moveList):
             nd2[n.position].value = o
             nd2 = simplifyNodeDict(nd2)
             
-            answer = solvePuzzle(nd2, movesRemaining-1, moveList + [(n.position, o)])
+            answer = solvePuzzleBruteForce(nd2, movesRemaining-1, moveList + [(n.position, o)])
             if answer:
                 return answer
 
+def solvePuzzleByPathFinding(nd, numMoves):
+    pathToNodeBySN, nodesAtDistanceBySN = computeNodeDistances(nd, numMoves)
+    # Find the node that is in common among all nodes
+    commonNodes = None
+    for k in pathToNodeBySN:
+        if commonNodes is None:
+            commonNodes = set(pathToNodeBySN[k].keys())
+        else:
+            commonNodes = commonNodes & set(pathToNodeBySN[k])
+                
+#    print 'Common Nodes', commonNodes
+    if len(commonNodes) == 1:
+        n = next(iter(commonNodes))
+    #    print nodesAtDistanceBySN[n][-1]
+        for farNode in nodesAtDistanceBySN[n][-1]:
+    #         print pathToNodeBySN[n][farNode]
+            pass
+        return pathToNodeBySN[n][farNode]
+    else:
+        return None
+
+def computeNodeDistances(nd, numMoves):
+    nodesAtDistanceByStartNode = {}
+    pathToNodeByStartNode = {}
+    for key in nd:
+        nodesAtDistance = []
+        currNode = nd[key]
+        currNodeSet = {currNode}
+        pathToNode = {currNode:[currNode]}
+        for i in range(numMoves):
+            nextNodeSet = set()
+            for n in currNodeSet:
+                for conn in n.connections:
+                    if conn in pathToNode:
+                        continue
+                    pathToNode[conn] = pathToNode[n] + [conn]
+                    nextNodeSet |= {conn}
+            currNodeSet = nextNodeSet
+            nodesAtDistance.append(set(nextNodeSet))
+        nodesAtDistanceByStartNode[currNode] = list(nodesAtDistance)
+        pathToNodeByStartNode[currNode] = dict(pathToNode)
+
+    return pathToNodeByStartNode, nodesAtDistanceByStartNode
+
+def createNodeDescriptorFromNode(n):
+    nDescriptor = (n.position, n.value)
+    nConnectionsDescriptor = frozenset([(conn.position, conn.value)
+                                         for conn in n.connections])
+    return (nDescriptor, nConnectionsDescriptor)
+
+def createDescriptorFromNodeDict(nd):
+    return frozenset([createNodeDescriptorFromNode(nd[k]) for k in nd]) 
+
+class AStarNode:
+    def __init__(self, pathToNode, value):
+        self.value = value
+        self.pathToNode = pathToNode
+
+    def __hash__(self):
+        return hash(createDescriptorFromNodeDict(self.value))
+
+
+def findCommonNodes(nd, movesRemaining):
+    pathToNodeBySN, nodesAtDistanceBySN = computeNodeDistances(nd, movesRemaining) 
+    for i in range(movesRemaining):
+        commonNodes = None
+        for k, n in nd.iteritems():
+            nodesLessThanCurrDist = set(list(itertools.chain(*[list(s) for s in
+                                                        nodesAtDistanceBySN[n][:i+1]])) + [n])
+            if commonNodes is None:
+                commonNodes = nodesLessThanCurrDist 
+            else:
+                commonNodes = commonNodes & nodesLessThanCurrDist
+
+            if len(commonNodes) == 0:
+                break
+        if len(commonNodes) > 0:
+            return commonNodes, i+1
+    return set(), movesRemaining
+
+def estimateCostToEnd(nd, movesRemaining):
+    if checkIfSolved(nd):
+        return 0
+    
+    options = set()
+    for k, n in nd.iteritems():
+        options = options | {n.value}
+
+    if len(options) - 1 > movesRemaining:
+        return 200
+
+    commonNodes, movesToCommonNode = findCommonNodes(nd, movesRemaining)
+
+    pathToNodeBySN, nodesAtDistanceBySN = computeNodeDistances(nd, movesRemaining) 
+
+
+    secondaryMovesLeft = []
+    if len(commonNodes) > 0:
+        for startNode in commonNodes:
+            uniquePaths = set()
+            for endNode in nodesAtDistanceBySN[startNode][movesToCommonNode-1]:
+                path = [n.value for n in pathToNodeBySN[startNode][endNode]]
+                uniquePaths |= {tuple(path)}
+            for p in uniquePaths:
+                tmp = copyNodeDict(nd)
+                nodePosToModify = startNode.position
+                for value in p[1:]:
+                    tmp[nodePosToModify].value = value
+                    tmp, oldToNew = simplifyNodeDict(tmp, returnOldToNew=True)
+                    nodePosToModify = oldToNew.get(nodePosToModify, nodePosToModify)
+                
+                _, movesToCommonNode2 = findCommonNodes(tmp, movesRemaining - movesToCommonNode)
+                secondaryMovesLeft.append(movesToCommonNode2)
+
+
+        return movesToCommonNode + np.min(secondaryMovesLeft)
+
+    return 100
+
+def solvePuzzleAStar(nd, movesRemaining):
+    # If we imagine that a graph can be represented as a node, where each
+    # connected node is reached by setting a node to a new value and simplifying,
+    # We can define our solution as a path through this graph from the starting
+    # configuration to a goal state.
+    startNode = AStarNode([], nd)
+    visitedNodes = set([startNode])
+    nodesToExplore = Queue.PriorityQueue()
+    nodesToExplore.put((0, startNode))
+
+    while not nodesToExplore.empty():
+        cost, currAStarNode = nodesToExplore.get()
+        currGraph = currAStarNode.value
+
+        if checkIfSolved(currGraph):
+            print 'Found Solution!'
+            return currAStarNode.pathToNode
+
+        if cost > 100:
+            print 'Skipping', currAStarNode.pathToNode
+            continue
+        
+        # For each (A*) node, we need to evaluate all of the potential options
+        commonNodes, _ = findCommonNodes(currGraph, movesRemaining - 
+                                         len(currAStarNode.pathToNode))
+        for n in commonNodes:
+            key = n.position
+            options = set()
+            for conn in n.connections:
+                options |= {conn.value}
+
+            for o in options:
+                nd2 = copyNodeDict(currGraph)
+                nd2[key].value = o
+                nd2 = simplifyNodeDict(nd2)
+
+                newAStarNode = AStarNode(currAStarNode.pathToNode + [(key, o)], nd2)
+                if newAStarNode in visitedNodes:
+                    'Already Visited', newAStarNode.pathToNode
+                    continue
+                
+                # estimate the cost to the end
+                costToCurrNode = len(newAStarNode.pathToNode)
+                costToEnd = estimateCostToEnd(nd2, movesRemaining - costToCurrNode)
+                totalCost = costToCurrNode + costToEnd
+                
+                visitedNodes |= {newAStarNode}
+
+                if totalCost > 50:
+                    print 'Skipping', newAStarNode.pathToNode, totalCost
+                    continue
+                nodesToExplore.put((totalCost, newAStarNode))
+                print 'Pushing', newAStarNode.pathToNode, totalCost, costToEnd
+            
 if __name__ == '__main__':
-    import glob
-    fileList = glob.glob('test17.tiff')
+    numMovesFile = 'tests.json'
+    with open(numMovesFile, 'r') as fileIn:
+        numMovesDict = json.load(fileIn)
+    fileList = glob.glob('test3.tiff')
     for f in fileList:
         img = plt.imread(f)/255.0
-        plt.figure()
-        plt.imshow(img)
-        plt.show(block=False)
-        movesRemaining = int(raw_input('Enter number of allowed moves:'))
-        plt.close('all')
+
+        movesRemaining = numMovesDict.get(f, None)
+        if movesRemaining is None:
+            plt.figure()
+            plt.imshow(img)
+            plt.show(block=False)
+            movesRemaining = int(raw_input('Enter number of allowed moves:'))
+            plt.close('all')
+        else:
+            print 'Moves Remaining:', movesRemaining
         colorOptions = colorOptionsFromScreenshot(img, debug=False)
 
         segs = segmentImage(img, colorOptions, debug=True)
@@ -407,9 +604,19 @@ if __name__ == '__main__':
         g = simplifyNodeDict(g)
         drawNodeDict(g, f)
         plt.show(block=False)
-        solution = solvePuzzle(g, movesRemaining, [])
-        print solution
-        print segs
+        # Attempt to solve by path finding from common node at distance
+    #    solution = solvePuzzleByPathFinding(g, movesRemaining)
+        solution = solvePuzzleAStar(g, movesRemaining)
+        if solution:
+            print 'Solution found by A Star'
+            print solution
+        else:
+            print 'Solution not found by path finding'
+
+#        if solution is None:
+#            solution = solvePuzzleBruteForce(g, movesRemaining, [])
+#            print 'Brute Force:', solution
+#        print segs
 
     plt.show(block=False)
 
